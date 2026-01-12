@@ -1,0 +1,372 @@
+---
+title: "T4-Y1"
+output: html_document
+date: "2025-06-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+Sys.setenv(JAVA_HOME = "C:/Program Files/Eclipse Adoptium/jdk-21.0.7.6-hotspot")
+
+install.packages("rJava")
+library(rJava)
+
+install.packages("bartMachine")
+options(java.parameters = "-Xmx4g")  # 메모리 충분히
+library(bartMachine)
+set_bart_machine_num_cores(4)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(skimr)
+
+library(MatchIt)
+library(cobalt)
+library(glmnet)
+library(forcats)
+library(cfcausal)
+library(grf)
+
+library(ggplot2)
+
+library(caret)
+library(xgboost)
+```
+
+```{r}
+data <- read_csv("C:/Users/1004c/Desktop/통계청 논문 공모전/Data/df_processed.csv")
+
+skim(data)
+names(data)
+```
+
+# Assumptions
+- T4_내일배움카드_참여경험
+
+(1) df_T4: "T4_내일배움카드_들어본_경험"이 있는 사람들만 뽑기
+```{r}
+# Y - (임금) 취업 여부 => 이것만 활용
+selected_cols_T4 <- grep("^(X1_|X2_|X3_|Y_임금근로자_첫_일자리|T4_)", names(data), value = TRUE)
+
+# 행정 인턴제 들어본 경험이 있는 경우만 filtering
+df_T4 <- data %>%
+  select(all_of(selected_cols_T4)) %>%
+  filter(T4_내일배움카드_들어본_경험 == 1)
+```
+
+
+(2) Y가 0인 값 제외
+```{r}
+skim(df_T4)
+```
+
+
+(2) NA value 처리
+- 연령대: Missing 유지(Categorical)
+- 부모소득구간: Missing 유지(Categorical)
+- 부모학력: NA 지우기
+```{r}
+df_T4 <- df_T4 %>%
+  filter(!is.na(X1_부모학력)) %>%
+  mutate(
+    X1_연령대 = fct_na_value_to_level(as.factor(X1_연령대), level = "Missing"),
+    X1_부모소득구간 = fct_na_value_to_level(as.factor(X1_부모소득구간), level = "Missing"),
+    X2_전공그룹 = as.factor(X2_전공그룹)
+  )
+```
+
+```{r}
+# Missing이라는 범주가 생겼는지 확인
+levels(df_T4$X1_연령대)
+levels(df_T4$X1_부모소득구간)
+
+# NA 개수 여전히 있는지 확인 (X1_부모학력은 그대로 두기로 함)
+sum(is.na(df_T4$X1_부모학력))
+```
+
+## 1. Ignorability
+- 처치와 결과가 공변량 X에 조건부로 독립임: 처치군과 통제군의 공변량 분포가 유사해야 함
+
+```{r}
+skim(df_T4)
+```
+
+(1) raw data 기준
+```{r}
+# 1. covariates만 선택: Y_, T4_ 으로 시작하는 변수 제외
+covariates <- names(df_T4)
+covariates <- covariates[!grepl("^Y_|^T4_", covariates)]
+
+treat_col <- "T4_내일배움카드_참여경험"
+
+# 2. Formula 생성
+fml <- as.formula(paste(treat_col, "~", paste(covariates, collapse = " + ")))
+
+# 3. 공변량 균형 상태 확인 (처치만 적용된 원자료 기준)
+bal.tab(fml, 
+        data = df_T4,
+        un = TRUE,
+        m.threshold = 0.1)
+
+# 4. 시각화 (처치 전 SMD 기준 love plot)
+love.plot(fml, 
+          data = df_T4, 
+          threshold = 0.1)
+```
+
+(2) weighted 포함 ignorability check
+```{r}
+# 1. covariates만 선택: Y_, T4_ 으로 시작하는 변수 제외
+covariates <- names(df_T4)
+covariates <- covariates[!grepl("^Y_|^T4_", covariates)]
+
+treat_col <- "T4_내일배움카드_참여경험"
+
+# 2. Formula 생성
+fml_weighted <- as.formula(paste(treat_col, "~", paste(covariates, collapse = " + ")))
+
+# 3. propensity score 추정
+ps_model <- glm(fml_weighted, data = df_T4, family = binomial)
+ps <- predict(ps_model, type = "response")
+
+# 4. ATE 기반 inverse propensity weights 계산
+df_T4$weights <- ifelse(df_T4[[treat_col]] == 1,
+                        1 / ps,
+                        1 / (1 - ps))
+
+# 5. 공변량 균형 평가
+bal.tab(fml_weighted,
+        data = df_T4,
+        weights = df_T4$weights,
+        method = "weighting",
+        un = TRUE,
+        m.threshold = 0.1)
+
+# 6. love plot 출력
+love.plot(fml_weighted,
+          data = df_T4,
+          weights = df_T4$weights,
+          method = "weighting",
+          threshold = 0.1)
+```
+
+
+## 2. Overlap
+- Propensity score이 0 또는 1에 치우치지 않고, 모든 관측치에서 0 < e(x) < 1의 분포를 갖는다는 가정
+- 처치군/통제군의 PS 분포가 겹치는지 확인
+
+1. GLM으로 진행행
+```{r}
+# 1. 변수 선택
+covariates <- names(df_T4)
+covariates <- covariates[!grepl("^Y_|^T4_|^weights", covariates)]
+covariates <- setdiff(covariates, c("ps", "treat_label"))
+
+# 2. Formula 생성
+fml_weighted <- as.formula(paste(treat_col, "~", paste(covariates, collapse = " + ")))
+
+# 3. Propensity score 추정
+ps_model <- glm(fml_weighted, data = df_T4, family = binomial)
+ps <- predict(ps_model, type = "response")
+
+# 4. Truncate
+ps <- pmin(pmax(ps, 0.01), 0.99)
+
+# 5. Plot용 변수 생성
+df_T4$ps <- ps
+df_T4$treat_label <- ifelse(df_T4[[treat_col]] == 1, "Treated", "Control")
+
+# 6. 시각화
+# ggplot(df_T4, aes(x = ps, fill = treat_label)) +
+#  geom_density(alpha = 0.4) +
+#  labs(title = "Propensity Score Overlap", x = "Propensity Score", fill = "Group") +
+#  theme_minimal()
+
+```
+
+```{r}
+ggplot(df_T4, aes(x = ps)) +
+  geom_density(data = subset(df_T4, treat_label == "Treated"),
+               aes(color = "Treated", linetype = "Treated"), size = 1.2) +
+  geom_density(data = subset(df_T4, treat_label == "Control"),
+               aes(color = "Control", linetype = "Control"), size = 1.2) +
+
+  # 좀 더 고급스러운 파스텔톤 색상
+  scale_color_manual(values = c("Treated" = "#8da0cb",  # 파스텔 블루
+                                "Control" = "#fdbf6f")) +  # 파스텔 오렌지
+  scale_linetype_manual(values = c("Treated" = "solid", "Control" = "dashed")) +
+
+  labs(x = "Propensity Score", y = "Density", color = NULL, linetype = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = c(0.85, 0.85),
+    legend.background = element_blank(),
+    legend.box.background = element_blank(),
+    legend.key = element_blank(),
+    legend.text = element_text(size = 13),
+    legend.key.width = unit(2, "lines"),
+    legend.key.height = unit(0.7, "lines")
+  )
+```
+
+
+2. XGboost로 진행
+
+```{r}
+# factor levels을 명시적으로 설정
+df_T4[[treat_col]] <- factor(df_T4[[treat_col]],
+                             levels = c(0, 1),
+                             labels = c("Control", "Treated"))
+
+# formula 정의
+fml_weighted <- as.formula(paste(treat_col, "~", paste(covariates, collapse = " + ")))
+
+# xgboost 학습
+ps_model <- train(
+  fml_weighted,
+  data = df_T4,
+  method = "xgbTree",
+  trControl = trainControl(method = "cv", number = 5, classProbs = TRUE),
+  verbose = FALSE
+)
+
+# 확률 예측
+pred_probs <- predict(ps_model, type = "prob")
+df_T4$ps <- pred_probs[, "Treated"]  # "Treated"에 해당하는 확률 사용
+
+# 라벨 생성
+df_T4$treat_label <- ifelse(df_T4[[treat_col]] == "Treated", "Treated", "Control")
+
+# 시각화
+ggplot(df_T4, aes(x = ps, fill = treat_label)) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Propensity Score Overlap", x = "Propensity Score", fill = "Group") +
+  theme_minimal()
+```
+
+
+(2) 최종 분석에 사용할 df_T4_final 생성
+```{r}
+quantile(df_T4$ps, probs = c(0, 0.01, 0.05, 0.1, 0.9, 0.95, 0.99, 1))
+df_cf <- df_T4[df_T4$ps >= 0.01 & df_T4$ps <= 0.99, ]
+
+# 1. 안 쓰는 변수 제거: weights, ps, treat_label, T4_내일배움카드_들어본_경험
+drop_vars <- c("weights", "ps", "treat_label", "T4_내일배움카드_들어본_경험")
+df_cf <- df_cf[, !(names(df_cf) %in% drop_vars)]
+```
+
+```{r}
+names(df_cf)
+skim(df_cf)
+str(df_cf)
+```
+
+(3) 최종 df(df_cf_T1) 저장
+```{r}
+file_path = "C:/Users/1004c/Desktop/통계청 논문 공모전/Data/T4_Y1/df_cf_T4.csv"
+
+write_excel_csv(df_cf, file_path)
+```
+
+```{r}
+table(df_cf$T4_내일배움카드_참여경험)
+```
+
+
+# ITE - CQR
+```{r}
+df_cf <- read_csv("C:/Users/1004c/Desktop/통계청 논문 공모전/Data/T4_Y1/df_cf_T4.csv")
+```
+
+```{r}
+names(df_cf)
+```
+
+```{r}
+# T: 처치 변수 (0/1), Y: 결과 변수, X: 공변량
+T <- df_cf$T4_내일배움카드_참여경험
+T <- ifelse(T == "Treated", 1, 0)
+Y <- df_cf$Y_임금근로자_첫_일자리
+# Y <- as.factor(Y)
+X <- df_cf[, setdiff(names(df_cf), c("T4_내일배움카드_참여경험", "Y_임금근로자_첫_일자리"))]
+
+# 수치형 행렬로 변환 (factor 포함)
+X_mat <- model.matrix(~ . - 1, data = X)
+
+# conformal ITE 추정 함수 정의
+CIfun <- conformalIte(
+  X = X_mat, 
+  Y = Y, 
+  T = T, 
+  alpha = 0.1,
+  algo = "nest",
+  exact = TRUE,
+  type = "mean",       # 평균 ITE 기반
+  outfun = "RF",     # 베이지안 회귀 트리
+  psfun = "Boosting",  # 처치 확률 추정 (GBM 기반)
+  citype = "mean",     # 신뢰구간 방법도 mean 기반
+  useCV = TRUE         # CV+ 방식 사용
+)
+
+# X 활용한 예측
+result <- CIfun(X_mat)
+
+result
+```
+
+- result_df 저장
+```{r}
+file_path = "C:/Users/1004c/Desktop/통계청 논문 공모전/Data/T4_Y1/T4_mean_RF_reg.csv"
+
+result_df <- as.data.frame(result)
+write_excel_csv(result_df, file_path)
+```
+
+
+## 1. 신뢰구간 Evaluation
+
+```{r}
+result_df <- as.data.frame(result)
+```
+
+```{r}
+# Y: 실제 관측값 (예: Y <- df_cf$Y_임금근로자_첫_일자리)
+# result_df: 신뢰구간 결과 (columns: lower, upper)
+
+# 1. Empirical Coverage
+result_df$Y <- Y  # 실제값 붙이기
+result_df$covered <- with(result_df, Y >= lower & Y <= upper)
+empirical_coverage <- mean(result_df$covered)
+
+# 2. Interval Length
+result_df$interval_length <- with(result_df, upper - lower)
+mean_interval_length <- mean(result_df$interval_length)
+
+# 3. Lower bound > 0 비율
+result_df$lower_positive <- result_df$lower > 0
+proportion_lower_positive <- mean(result_df$lower_positive)
+
+# 결과 출력
+cat("Empirical Coverage:", round(empirical_coverage, 3), "\n")
+cat("Mean Interval Length:", round(mean_interval_length, 3), "\n")
+cat("Proportion with Lower Bound > 0:", round(proportion_lower_positive, 3), "\n")
+```
+```{r}
+# Histogram of lower bounds
+ggplot(result_df, aes(x = lower)) +
+  geom_histogram(bins = 50, fill = "skyblue", color = "black") +
+  labs(title = "Distribution of Lower Bounds", x = "Lower Bound", y = "Count")
+
+# Boxplot of interval lengths
+ggplot(result_df, aes(y = interval_length)) +
+  geom_boxplot(fill = "lightgreen") +
+  labs(title = "Interval Length Distribution", y = "Interval Length")
+
+```
+
